@@ -1,800 +1,471 @@
 #!/usr/bin/env python3
-
 import argparse
+import concurrent.futures
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
+import pathlib
+import re
 import shlex
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any
 
+VERSION = '2.0.0'
 
 @dataclass
 class CommandResult:
-    command: str
+    argv: list[str]
     returncode: int
     stdout: str
     stderr: str
-    duration_s: float
-
-
-@dataclass
-class HostProbe:
-    host: str
-    target: str
-    is_local: bool
-    reachable: bool
-    error: str = ""
-    hostname: str = ""
-    fqdn: str = ""
-    os_pretty_name: str = ""
-    kernel: str = ""
-    python_version: str = ""
-    timezone: str = ""
-    ntp_service_active: Optional[bool] = None
-    ntp_synchronized: Optional[bool] = None
-    local_rtc: Optional[bool] = None
-    localtime_path: str = ""
-    localtime_sha256: str = ""
-    zoneinfo_path: str = ""
-    zoneinfo_sha256: str = ""
-    now_iso: str = ""
-    now_epoch: Optional[int] = None
-    utc_offset: str = ""
-    tz_abbrev: str = ""
-    timedatectl_available: bool = False
-    source: str = ""
-    warnings: List[str] = field(default_factory=list)
-    raw_fields: Dict[str, str] = field(default_factory=dict)
-    command_log: List[CommandResult] = field(default_factory=list)
-
+    elapsed: float
+    timed_out: bool = False
 
 @dataclass
-class ComparisonIssue:
-    category: str
+class Sample:
+    t0: float
+    t1: float
+    remote_epoch: float | None
+    offset: float | None
+    uncertainty: float | None
+    duration: float
+    error: str = ''
+
+@dataclass
+class Finding:
     severity: str
-    message: str
-    hosts: List[str] = field(default_factory=list)
-
+    code: str
+    host: str
+    detail: str
 
 @dataclass
-class ComparisonSummary:
-    reference_host: str = ""
-    timezone_consistent: bool = True
-    localtime_target_consistent: bool = True
-    localtime_hash_consistent: bool = True
-    zoneinfo_hash_consistent: bool = True
-    ntp_consistent: bool = True
-    synchronized_consistent: bool = True
-    utc_offset_consistent: bool = True
-    clock_skew_within_threshold: bool = True
-    max_clock_skew_seconds: Optional[int] = None
-    issues: List[ComparisonIssue] = field(default_factory=list)
+class Host:
+    target: str
+    local: bool = False
+    reachable: bool = False
+    hostname: str = ''
+    os_name: str = ''
+    kernel: str = ''
+    timezone: str = ''
+    timezone_source: str = ''
+    utc_offset: str = ''
+    abbreviation: str = ''
+    localtime_target: str = ''
+    localtime_sha256: str = ''
+    zoneinfo_sha256: str = ''
+    tzdata_version: str = ''
+    ntp_enabled: bool | None = None
+    ntp_synchronized: bool | None = None
+    rtc_local: bool | None = None
+    chrony_active: bool | None = None
+    chrony_tracking: dict[str, str] = field(default_factory=dict)
+    chrony_sources: list[str] = field(default_factory=list)
+    chrony_metrics: dict[str, float] = field(default_factory=dict)
+    timesyncd_status: dict[str, str] = field(default_factory=dict)
+    samples: list[Sample] = field(default_factory=list)
+    offset_seconds: float | None = None
+    uncertainty_seconds: float | None = None
+    rtt_seconds: float | None = None
+    raw: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
+class Runner:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
 
-class Ansi:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
-    CYAN = "\033[36m"
-
-
-class RemoteExecutor:
-    def __init__(
-        self,
-        ssh_user: Optional[str] = None,
-        ssh_port: int = 22,
-        ssh_options: Optional[List[str]] = None,
-        connect_timeout: int = 5,
-    ) -> None:
-        self.ssh_user = ssh_user
-        self.ssh_port = ssh_port
-        self.connect_timeout = connect_timeout
-        self.ssh_options = ssh_options or []
-
-    def run(self, target: str, command: str, is_local: bool) -> CommandResult:
-        start = time.time()
-        if is_local:
-            proc = subprocess.run(
-                ["bash", "-lc", command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+    def execute(self, target: str, local: bool, script: str, timeout: float | None = None) -> CommandResult:
+        if local:
+            argv = ['bash', '-s']
         else:
-            ssh_target = target
-            if self.ssh_user and "@" not in target:
-                ssh_target = f"{self.ssh_user}@{target}"
-            ssh_cmd = [
-                "ssh",
-                "-p",
-                str(self.ssh_port),
-                "-o",
-                f"ConnectTimeout={self.connect_timeout}",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-            ]
-            ssh_cmd.extend(self.ssh_options)
-            ssh_cmd.append(ssh_target)
-            ssh_cmd.append(command)
-            proc = subprocess.run(
-                ssh_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        end = time.time()
-        return CommandResult(
-            command=command,
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            duration_s=end - start,
-        )
-
-
-class HostInspector:
-    REMOTE_SCRIPT = r"""
-set -u
-
-emit() {
-  printf '%s=%s\n' "$1" "$2"
-}
-
-boolify() {
-  case "${1:-}" in
-    yes|true|1) printf 'true' ;;
-    no|false|0) printf 'false' ;;
-    *) printf 'unknown' ;;
-  esac
-}
-
-sha256_of_file() {
-  if [ -f "$1" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum "$1" | awk '{print $1}'
-      return 0
-    fi
-    if command -v openssl >/dev/null 2>&1; then
-      openssl dgst -sha256 "$1" | awk '{print $NF}'
-      return 0
-    fi
-  fi
-  printf ''
-}
-
-os_pretty_name=''
-if [ -r /etc/os-release ]; then
-  os_pretty_name=$(awk -F= '/^PRETTY_NAME=/{gsub(/^"/, "", $2); gsub(/"$/, "", $2); print $2}' /etc/os-release 2>/dev/null)
-fi
-
-hostname_short=$(hostname 2>/dev/null || printf '')
-hostname_fqdn=$(hostname -f 2>/dev/null || printf '')
-kernel=$(uname -srmo 2>/dev/null || printf '')
-python_version=$(python3 -V 2>/dev/null | awk '{print $2}')
-if [ -z "$python_version" ]; then
-  python_version=$(python -V 2>/dev/null | awk '{print $2}')
-fi
-
-timedatectl_available=false
-timezone=''
-ntp_enabled='unknown'
-ntp_synced='unknown'
-local_rtc='unknown'
-
-if command -v timedatectl >/dev/null 2>&1; then
-  timedatectl_available=true
-  while IFS='=' read -r key value; do
-    case "$key" in
-      Timezone) timezone="$value" ;;
-      NTP) ntp_enabled=$(boolify "$value") ;;
-      NTPSynchronized) ntp_synced=$(boolify "$value") ;;
-      LocalRTC) local_rtc=$(boolify "$value") ;;
-    esac
-  done < <(timedatectl show --property=Timezone --property=NTP --property=NTPSynchronized --property=LocalRTC 2>/dev/null)
-fi
-
-if [ -z "$timezone" ] && [ -r /etc/timezone ]; then
-  timezone=$(head -n1 /etc/timezone 2>/dev/null)
-fi
-
-localtime_path=$(readlink -f /etc/localtime 2>/dev/null || printf '')
-localtime_hash=$(sha256_of_file /etc/localtime)
-zoneinfo_path=''
-zoneinfo_hash=''
-
-if [ -n "$timezone" ] && [ -f "/usr/share/zoneinfo/$timezone" ]; then
-  zoneinfo_path="/usr/share/zoneinfo/$timezone"
-  zoneinfo_hash=$(sha256_of_file "$zoneinfo_path")
-fi
-
-now_iso=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf '')
-now_epoch=$(date '+%s' 2>/dev/null || printf '')
-utc_offset=$(date '+%z' 2>/dev/null || printf '')
-tz_abbrev=$(date '+%Z' 2>/dev/null || printf '')
-
-emit host_probe_version 1
-emit hostname "$hostname_short"
-emit fqdn "$hostname_fqdn"
-emit os_pretty_name "$os_pretty_name"
-emit kernel "$kernel"
-emit python_version "$python_version"
-emit timedatectl_available "$timedatectl_available"
-emit timezone "$timezone"
-emit ntp_service_active "$ntp_enabled"
-emit ntp_synchronized "$ntp_synced"
-emit local_rtc "$local_rtc"
-emit localtime_path "$localtime_path"
-emit localtime_sha256 "$localtime_hash"
-emit zoneinfo_path "$zoneinfo_path"
-emit zoneinfo_sha256 "$zoneinfo_hash"
-emit now_iso "$now_iso"
-emit now_epoch "$now_epoch"
-emit utc_offset "$utc_offset"
-emit tz_abbrev "$tz_abbrev"
-"""
-
-    def __init__(self, executor: RemoteExecutor, verbose: bool = False) -> None:
-        self.executor = executor
-        self.verbose = verbose
-
-    def inspect(self, target: str, local_aliases: Sequence[str]) -> HostProbe:
-        is_local = self._is_local_target(target, local_aliases)
-        probe = HostProbe(host=target, target=target, is_local=is_local, reachable=False)
-
-        result = self.executor.run(target, self.REMOTE_SCRIPT, is_local=is_local)
-        probe.command_log.append(result)
-
-        if result.returncode != 0:
-            probe.error = self._clean_text(result.stderr) or f"probe failed with rc={result.returncode}"
-            return probe
-
-        raw = self._parse_key_value_output(result.stdout)
-        probe.raw_fields = raw
-        probe.reachable = True
-        probe.hostname = raw.get("hostname", "")
-        probe.fqdn = raw.get("fqdn", "")
-        probe.os_pretty_name = raw.get("os_pretty_name", "")
-        probe.kernel = raw.get("kernel", "")
-        probe.python_version = raw.get("python_version", "")
-        probe.timezone = raw.get("timezone", "")
-        probe.ntp_service_active = self._parse_tri_bool(raw.get("ntp_service_active", "unknown"))
-        probe.ntp_synchronized = self._parse_tri_bool(raw.get("ntp_synchronized", "unknown"))
-        probe.local_rtc = self._parse_tri_bool(raw.get("local_rtc", "unknown"))
-        probe.localtime_path = raw.get("localtime_path", "")
-        probe.localtime_sha256 = raw.get("localtime_sha256", "")
-        probe.zoneinfo_path = raw.get("zoneinfo_path", "")
-        probe.zoneinfo_sha256 = raw.get("zoneinfo_sha256", "")
-        probe.now_iso = raw.get("now_iso", "")
-        probe.utc_offset = raw.get("utc_offset", "")
-        probe.tz_abbrev = raw.get("tz_abbrev", "")
-        probe.timedatectl_available = raw.get("timedatectl_available", "").lower() == "true"
-
-        epoch_raw = raw.get("now_epoch", "")
+            remote = target if '@' in target or not self.args.ssh_user else self.args.ssh_user + '@' + target
+            argv = ['ssh', '-T', '-p', str(self.args.ssh_port), '-o', 'BatchMode=yes', '-o', 'NumberOfPasswordPrompts=0', '-o', 'ConnectTimeout=' + str(self.args.connect_timeout), '-o', 'StrictHostKeyChecking=' + self.args.host_key_policy]
+            for option in self.args.ssh_option:
+                argv.extend(['-o', option])
+            argv.extend([remote, 'bash -s'])
+        start = time.monotonic()
         try:
-            probe.now_epoch = int(epoch_raw) if epoch_raw else None
-        except ValueError:
-            probe.now_epoch = None
+            p = subprocess.run(argv, input=script, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout or self.args.timeout, check=False)
+            return CommandResult(argv, p.returncode, p.stdout, p.stderr, time.monotonic()-start)
+        except subprocess.TimeoutExpired as e:
+            return CommandResult(argv, 124, '', str(e), time.monotonic()-start, True)
+        except OSError as e:
+            return CommandResult(argv, 127, '', str(e), time.monotonic()-start)
 
-        if not probe.timezone:
-            probe.warnings.append("timezone_unresolved")
-        if not probe.localtime_path:
-            probe.warnings.append("localtime_path_unresolved")
-        if not probe.localtime_sha256:
-            probe.warnings.append("localtime_hash_unresolved")
-        if probe.timedatectl_available and probe.ntp_service_active is None:
-            probe.warnings.append("ntp_state_unresolved")
-        if probe.timedatectl_available and probe.ntp_synchronized is None:
-            probe.warnings.append("sync_state_unresolved")
-        if probe.zoneinfo_path and not probe.zoneinfo_sha256:
-            probe.warnings.append("zoneinfo_hash_unresolved")
+PROBE = r'''
+set +e
+emit() { printf '%s=%s\n' "$1" "${2//$'\n'/ }"; }
+first() { head -n 1; }
+sha() { if [ -f "$1" ]; then if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | awk '{print $NF}'; fi; fi; }
+kv() { local val; val=$(timedatectl show -p "$1" --value 2>/dev/null | first); emit "$2" "$val"; }
+emit probe_version 2
+emit hostname "$(hostname 2>/dev/null)"
+emit os_name "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | first | tr -d '"')"
+emit kernel "$(uname -sr 2>/dev/null)"
+if command -v timedatectl >/dev/null 2>&1; then
+  kv Timezone timezone
+  kv NTP ntp_enabled
+  kv NTPSynchronized ntp_synchronized
+  kv LocalRTC rtc_local
+fi
+emit timezone_file "$(cat /etc/timezone 2>/dev/null | first)"
+emit localtime_target "$(readlink -f /etc/localtime 2>/dev/null)"
+emit localtime_sha256 "$(sha /etc/localtime)"
+emit utc_offset "$(date +%z 2>/dev/null)"
+emit abbreviation "$(date +%Z 2>/dev/null)"
+emit date_epoch "$(date +%s.%N 2>/dev/null)"
+emit chrony_active "$(systemctl is-active chronyd 2>/dev/null)"
+if command -v rpm >/dev/null 2>&1; then
+  emit tzdata_version "$(rpm -q --qf '%{VERSION}-%{RELEASE}' tzdata 2>/dev/null | first)"
+elif command -v dpkg-query >/dev/null 2>&1; then
+  emit tzdata_version "$(dpkg-query -W -f='${Version}' tzdata 2>/dev/null | first)"
+fi
+if command -v chronyc >/dev/null 2>&1; then
+  emit chrony_tracking "$(chronyc -n tracking 2>/dev/null | base64 -w0 2>/dev/null)"
+  emit chrony_sources "$(chronyc -n sources -v 2>/dev/null | base64 -w0 2>/dev/null)"
+fi
+if command -v timedatectl >/dev/null 2>&1; then
+  emit timesyncd_status "$(timedatectl timesync-status --no-pager 2>/dev/null | base64 -w0 2>/dev/null)"
+fi
+'''
 
-        probe.source = "local" if is_local else "ssh"
-        return probe
+CLOCK = "printf 'epoch=%s\\n' \"$(date +%s.%N)\"\n"
 
-    def _is_local_target(self, target: str, local_aliases: Sequence[str]) -> bool:
-        lowered = target.strip().lower()
-        if lowered in {"localhost", "127.0.0.1", "::1", socket.gethostname().lower(), socket.getfqdn().lower()}:
-            return True
-        return lowered in {x.lower() for x in local_aliases}
-
-    def _parse_key_value_output(self, output: str) -> Dict[str, str]:
-        data: Dict[str, str] = {}
-        for line in output.splitlines():
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            data[key.strip()] = value.strip()
-        return data
-
-    def _parse_tri_bool(self, value: str) -> Optional[bool]:
-        lowered = value.strip().lower()
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-        return None
-
-    def _clean_text(self, value: str) -> str:
-        return value.strip().replace("\r", "")
-
-
-class Comparator:
-    def __init__(self, skew_threshold_seconds: int = 3) -> None:
-        self.skew_threshold_seconds = skew_threshold_seconds
-
-    def compare(self, probes: List[HostProbe]) -> ComparisonSummary:
-        summary = ComparisonSummary()
-        reachable = [p for p in probes if p.reachable]
-        if not reachable:
-            summary.issues.append(
-                ComparisonIssue(
-                    category="reachability",
-                    severity="critical",
-                    message="No reachable hosts to compare",
-                    hosts=[],
-                )
-            )
-            return summary
-
-        reference = reachable[0]
-        summary.reference_host = reference.hostname or reference.host
-
-        self._check_uniform_string(summary, reachable, "timezone", "timezone", "warning")
-        self._check_uniform_string(summary, reachable, "localtime_path", "localtime_target", "warning")
-        self._check_uniform_string(summary, reachable, "localtime_sha256", "localtime_hash", "warning")
-        self._check_uniform_string(summary, reachable, "zoneinfo_sha256", "zoneinfo_hash", "warning")
-        self._check_uniform_bool(summary, reachable, "ntp_service_active", "ntp", "warning")
-        self._check_uniform_bool(summary, reachable, "ntp_synchronized", "synchronized", "warning")
-        self._check_uniform_string(summary, reachable, "utc_offset", "utc_offset", "warning")
-
-        epochs = [(p.hostname or p.host, p.now_epoch) for p in reachable if p.now_epoch is not None]
-        if len(epochs) >= 2:
-            only_values = [epoch for _, epoch in epochs]
-            max_skew = max(only_values) - min(only_values)
-            summary.max_clock_skew_seconds = max_skew
-            if max_skew > self.skew_threshold_seconds:
-                summary.clock_skew_within_threshold = False
-                summary.issues.append(
-                    ComparisonIssue(
-                        category="clock_skew",
-                        severity="warning",
-                        message=f"Clock skew exceeds threshold: {max_skew}s > {self.skew_threshold_seconds}s",
-                        hosts=[name for name, _ in epochs],
-                    )
-                )
-
-        unreachable = [p for p in probes if not p.reachable]
-        if unreachable:
-            summary.issues.append(
-                ComparisonIssue(
-                    category="reachability",
-                    severity="warning",
-                    message=f"{len(unreachable)} host(s) unreachable",
-                    hosts=[p.host for p in unreachable],
-                )
-            )
-
-        unresolved = [p for p in reachable if p.warnings]
-        if unresolved:
-            summary.issues.append(
-                ComparisonIssue(
-                    category="partial_data",
-                    severity="info",
-                    message="Some hosts returned incomplete timezone or synchronization data",
-                    hosts=[p.hostname or p.host for p in unresolved],
-                )
-            )
-
-        return summary
-
-    def _check_uniform_string(
-        self,
-        summary: ComparisonSummary,
-        probes: List[HostProbe],
-        attr: str,
-        category: str,
-        severity: str,
-    ) -> None:
-        values: Dict[str, List[str]] = {}
-        for probe in probes:
-            value = getattr(probe, attr)
-            label = probe.hostname or probe.host
-            values.setdefault(str(value), []).append(label)
-
-        non_empty_values = [key for key in values.keys() if key]
-        consistent = len(set(non_empty_values)) <= 1 if non_empty_values else True
-
-        if category == "timezone":
-            summary.timezone_consistent = consistent
-        elif category == "localtime_target":
-            summary.localtime_target_consistent = consistent
-        elif category == "localtime_hash":
-            summary.localtime_hash_consistent = consistent
-        elif category == "zoneinfo_hash":
-            summary.zoneinfo_hash_consistent = consistent
-        elif category == "utc_offset":
-            summary.utc_offset_consistent = consistent
-
-        if not consistent:
-            detail = "; ".join(f"{repr(value)} -> {', '.join(hosts)}" for value, hosts in values.items() if value)
-            summary.issues.append(
-                ComparisonIssue(
-                    category=category,
-                    severity=severity,
-                    message=f"Inconsistent {category}: {detail}",
-                    hosts=[probe.hostname or probe.host for probe in probes],
-                )
-            )
-
-    def _check_uniform_bool(
-        self,
-        summary: ComparisonSummary,
-        probes: List[HostProbe],
-        attr: str,
-        category: str,
-        severity: str,
-    ) -> None:
-        values: Dict[str, List[str]] = {}
-        for probe in probes:
-            raw = getattr(probe, attr)
-            key = "unknown" if raw is None else str(raw).lower()
-            label = probe.hostname or probe.host
-            values.setdefault(key, []).append(label)
-
-        meaningful = [key for key in values.keys() if key != "unknown"]
-        consistent = len(set(meaningful)) <= 1 if meaningful else True
-
-        if category == "ntp":
-            summary.ntp_consistent = consistent
-        elif category == "synchronized":
-            summary.synchronized_consistent = consistent
-
-        if not consistent:
-            detail = "; ".join(f"{value} -> {', '.join(hosts)}" for value, hosts in values.items())
-            summary.issues.append(
-                ComparisonIssue(
-                    category=category,
-                    severity=severity,
-                    message=f"Inconsistent {category} state: {detail}",
-                    hosts=[probe.hostname or probe.host for probe in probes],
-                )
-            )
-
-
-class Formatter:
-    def __init__(self, use_color: bool = True, width: int = 120) -> None:
-        self.use_color = use_color
-        self.width = max(width, 80)
-
-    def _color(self, text: str, code: str) -> str:
-        if not self.use_color:
-            return text
-        return f"{code}{text}{Ansi.RESET}"
-
-    def _ok(self, text: str) -> str:
-        return self._color(text, Ansi.GREEN)
-
-    def _warn(self, text: str) -> str:
-        return self._color(text, Ansi.YELLOW)
-
-    def _bad(self, text: str) -> str:
-        return self._color(text, Ansi.RED)
-
-    def _info(self, text: str) -> str:
-        return self._color(text, Ansi.CYAN)
-
-    def _title(self, text: str) -> str:
-        return self._color(text, Ansi.BOLD)
-
-    def render_table(self, probes: List[HostProbe], summary: ComparisonSummary) -> str:
-        rows = []
-        headers = [
-            "host",
-            "reachable",
-            "timezone",
-            "utc_offset",
-            "tz",
-            "ntp",
-            "synced",
-            "localtime_target",
-            "local_sha256",
-            "epoch",
-        ]
-        rows.append(headers)
-
-        for p in probes:
-            rows.append(
-                [
-                    p.hostname or p.host,
-                    "yes" if p.reachable else "no",
-                    p.timezone or "-",
-                    p.utc_offset or "-",
-                    p.tz_abbrev or "-",
-                    self._bool_text(p.ntp_service_active),
-                    self._bool_text(p.ntp_synchronized),
-                    self._basename_or_full(p.localtime_path),
-                    p.localtime_sha256[:12] if p.localtime_sha256 else "-",
-                    str(p.now_epoch) if p.now_epoch is not None else "-",
-                ]
-            )
-
-        widths = [0] * len(headers)
-        for row in rows:
-            for idx, cell in enumerate(row):
-                widths[idx] = min(max(widths[idx], len(cell)), 40)
-
-        lines = []
-        lines.append(self._title("Timezone Consistency Report"))
-        lines.append(self._rule())
-
-        for idx, row in enumerate(rows):
-            rendered = "  ".join(row[i].ljust(widths[i]) for i in range(len(row)))
-            lines.append(rendered)
-            if idx == 0:
-                lines.append("  ".join("-" * widths[i] for i in range(len(row))))
-
-        lines.append("")
-        lines.extend(self._render_summary(summary))
-        lines.append("")
-        lines.extend(self._render_host_details(probes))
-        return "\n".join(lines)
-
-    def render_json(self, probes: List[HostProbe], summary: ComparisonSummary) -> str:
-        payload = {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "summary": asdict(summary),
-            "hosts": [asdict(p) for p in probes],
-        }
-        return json.dumps(payload, indent=2, ensure_ascii=False)
-
-    def _render_summary(self, summary: ComparisonSummary) -> List[str]:
-        lines = [self._title("Summary"), self._rule()]
-        checks = [
-            ("timezone_consistent", summary.timezone_consistent),
-            ("localtime_target_consistent", summary.localtime_target_consistent),
-            ("localtime_hash_consistent", summary.localtime_hash_consistent),
-            ("zoneinfo_hash_consistent", summary.zoneinfo_hash_consistent),
-            ("ntp_consistent", summary.ntp_consistent),
-            ("synchronized_consistent", summary.synchronized_consistent),
-            ("utc_offset_consistent", summary.utc_offset_consistent),
-            ("clock_skew_within_threshold", summary.clock_skew_within_threshold),
-        ]
-        for name, state in checks:
-            marker = self._ok("OK") if state else self._bad("MISMATCH")
-            lines.append(f"{name}: {marker}")
-
-        if summary.max_clock_skew_seconds is not None:
-            lines.append(f"max_clock_skew_seconds: {summary.max_clock_skew_seconds}")
-        if summary.reference_host:
-            lines.append(f"reference_host: {summary.reference_host}")
-
-        if summary.issues:
-            lines.append("")
-            lines.append(self._title("Issues"))
-            for issue in summary.issues:
-                prefix = self._severity(issue.severity)
-                host_part = f" [{', '.join(issue.hosts)}]" if issue.hosts else ""
-                lines.append(f"- {prefix} {issue.category}: {issue.message}{host_part}")
-        else:
-            lines.append("")
-            lines.append(self._ok("No comparison issues detected"))
-
-        return lines
-
-    def _render_host_details(self, probes: List[HostProbe]) -> List[str]:
-        lines = [self._title("Host Details"), self._rule()]
-        for p in probes:
-            name = p.hostname or p.host
-            status = self._ok("reachable") if p.reachable else self._bad("unreachable")
-            lines.append(f"{name}: {status}")
-            if not p.reachable:
-                lines.append(f"  error: {p.error or 'unknown'}")
-                continue
-            lines.append(f"  target: {p.target}")
-            lines.append(f"  source: {p.source}")
-            lines.append(f"  fqdn: {p.fqdn or '-'}")
-            lines.append(f"  os: {p.os_pretty_name or '-'}")
-            lines.append(f"  kernel: {p.kernel or '-'}")
-            lines.append(f"  python: {p.python_version or '-'}")
-            lines.append(f"  timezone: {p.timezone or '-'}")
-            lines.append(f"  utc_offset: {p.utc_offset or '-'}")
-            lines.append(f"  tz_abbrev: {p.tz_abbrev or '-'}")
-            lines.append(f"  ntp_service_active: {self._bool_text(p.ntp_service_active)}")
-            lines.append(f"  ntp_synchronized: {self._bool_text(p.ntp_synchronized)}")
-            lines.append(f"  local_rtc: {self._bool_text(p.local_rtc)}")
-            lines.append(f"  localtime_path: {p.localtime_path or '-'}")
-            lines.append(f"  localtime_sha256: {p.localtime_sha256 or '-'}")
-            lines.append(f"  zoneinfo_path: {p.zoneinfo_path or '-'}")
-            lines.append(f"  zoneinfo_sha256: {p.zoneinfo_sha256 or '-'}")
-            lines.append(f"  now_iso: {p.now_iso or '-'}")
-            lines.append(f"  now_epoch: {p.now_epoch if p.now_epoch is not None else '-'}")
-            if p.warnings:
-                lines.append(f"  warnings: {', '.join(p.warnings)}")
-            lines.append("")
-        if lines and lines[-1] == "":
-            lines.pop()
-        return lines
-
-    def _rule(self) -> str:
-        return "-" * min(self.width, 120)
-
-    def _severity(self, value: str) -> str:
-        if value == "critical":
-            return self._bad("CRITICAL")
-        if value == "warning":
-            return self._warn("WARNING")
-        return self._info("INFO")
-
-    def _bool_text(self, value: Optional[bool]) -> str:
-        if value is True:
-            return "true"
-        if value is False:
-            return "false"
-        return "unknown"
-
-    def _basename_or_full(self, value: str) -> str:
-        if not value:
-            return "-"
-        base = os.path.basename(value)
-        if base and base != "localtime":
-            return base
-        return value
-
-
-def read_hosts_from_file(path: str) -> List[str]:
-    hosts: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            hosts.append(stripped)
-    return hosts
-
-
-def unique_preserve_order(values: Sequence[str]) -> List[str]:
-    seen = set()
-    result = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
+def parse_lines(data: str) -> dict[str, str]:
+    result = {}
+    for line in data.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            if re.fullmatch(r'[a-z][a-z0-9_]*', key):
+                result[key] = value.strip()
     return result
 
+def tri(value: str) -> bool | None:
+    value = value.lower().strip()
+    if value in ('yes', 'true', '1', 'active'):
+        return True
+    if value in ('no', 'false', '0', 'inactive', 'failed'):
+        return False
+    return None
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare timezone, localtime, tzdata hashes, and clock state across Linux hosts")
-    parser.add_argument("hosts", nargs="*", help="Hosts to inspect. Use localhost for local system.")
-    parser.add_argument("--hosts-file", help="File with one host per line")
-    parser.add_argument("--ssh-user", help="SSH username")
-    parser.add_argument("--ssh-port", type=int, default=22, help="SSH port")
-    parser.add_argument("--ssh-option", action="append", default=[], help="Extra ssh option, may be repeated")
-    parser.add_argument("--timeout", type=int, default=5, help="SSH connect timeout in seconds")
-    parser.add_argument("--workers", type=int, default=8, help="Concurrent probe workers")
-    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text report")
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
-    parser.add_argument("--skew-threshold", type=int, default=3, help="Allowed clock skew in seconds")
-    parser.add_argument("--show-commands", action="store_true", help="Show executed command metadata")
-    parser.add_argument("--local-alias", action="append", default=[], help="Additional names treated as local")
-    parser.add_argument("--strict", action="store_true", help="Exit non-zero if mismatches are found")
-    return parser.parse_args()
+def decode64(value: str) -> str:
+    if not value:
+        return ''
+    try:
+        import base64
+        return base64.b64decode(value, validate=True).decode('utf-8', 'replace')
+    except (ValueError, UnicodeError):
+        return ''
 
+def parse_tracking(value: str) -> dict[str, str]:
+    result = {}
+    for line in value.splitlines():
+        if ':' in line:
+            key, data = line.split(':', 1)
+            result[key.strip()] = data.strip()
+    return result
 
-def collect_targets(args: argparse.Namespace) -> List[str]:
+def numeric_prefix(value: str) -> float | None:
+    match = re.search(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', value)
+    if not match:
+        return None
+    try:
+        return float(match.group())
+    except ValueError:
+        return None
+
+def local_names(args: argparse.Namespace) -> set[str]:
+    return {'localhost', '127.0.0.1', '::1', socket.gethostname().lower(), socket.getfqdn().lower()} | {v.lower() for v in args.local_alias}
+
+def inspect(target: str, args: argparse.Namespace, runner: Runner, aliases: set[str]) -> Host:
+    h = Host(target=target, local=target.lower() in aliases)
+    start = time.monotonic()
+    response = runner.execute(target, h.local, PROBE)
+    if response.returncode != 0:
+        h.errors.append(('probe timeout' if response.timed_out else 'probe failed') + ': ' + (response.stderr.strip()[:250] or str(response.returncode)))
+        h.elapsed_seconds = time.monotonic()-start
+        return h
+    d = parse_lines(response.stdout)
+    if d.get('probe_version') != '2':
+        h.errors.append('unexpected or incomplete probe response')
+        h.elapsed_seconds = time.monotonic()-start
+        return h
+    h.reachable = True
+    h.raw = d if args.include_raw else {}
+    h.hostname = d.get('hostname', '')
+    h.os_name = d.get('os_name', '')
+    h.kernel = d.get('kernel', '')
+    h.timezone = d.get('timezone', '')
+    h.timezone_source = 'timedatectl' if h.timezone else ''
+    if not h.timezone:
+        h.timezone = d.get('timezone_file', '')
+        h.timezone_source = '/etc/timezone' if h.timezone else ''
+    h.localtime_target = d.get('localtime_target', '')
+    if not h.timezone and '/zoneinfo/' in h.localtime_target:
+        h.timezone = h.localtime_target.split('/zoneinfo/', 1)[1]
+        h.timezone_source = 'localtime symlink'
+    h.utc_offset = d.get('utc_offset', '')
+    h.abbreviation = d.get('abbreviation', '')
+    h.localtime_sha256 = d.get('localtime_sha256', '')
+    h.tzdata_version = d.get('tzdata_version', '')
+    h.ntp_enabled = tri(d.get('ntp_enabled', ''))
+    h.ntp_synchronized = tri(d.get('ntp_synchronized', ''))
+    h.rtc_local = tri(d.get('rtc_local', ''))
+    h.chrony_active = tri(d.get('chrony_active', ''))
+    h.chrony_tracking = parse_tracking(decode64(d.get('chrony_tracking', '')))
+    h.chrony_sources = decode64(d.get('chrony_sources', '')).splitlines()
+    h.timesyncd_status = parse_tracking(decode64(d.get('timesyncd_status', '')))
+    for key, name in [('System time', 'system_time'), ('Last offset', 'last_offset'), ('RMS offset', 'rms_offset'), ('Root delay', 'root_delay'), ('Root dispersion', 'root_dispersion'), ('Update interval', 'update_interval'), ('Stratum', 'stratum'), ('Skew', 'skew')]:
+        value = numeric_prefix(h.chrony_tracking.get(key, ''))
+        if value is not None:
+            h.chrony_metrics[name] = value
+    if not h.timezone:
+        h.warnings.append('timezone could not be resolved')
+    if not h.localtime_sha256:
+        h.warnings.append('/etc/localtime could not be hashed')
+    if not h.tzdata_version:
+        h.warnings.append('tzdata package version unavailable')
+    if h.ntp_synchronized is None:
+        h.warnings.append('system synchronization status unavailable')
+    for _ in range(args.samples):
+        t0 = time.time()
+        c = runner.execute(target, h.local, CLOCK, timeout=args.sample_timeout)
+        t1 = time.time()
+        raw_epoch = parse_lines(c.stdout).get('epoch', '')
+        try:
+            epoch = float(raw_epoch)
+            if not (1e9 < epoch < 1e11):
+                raise ValueError('invalid epoch')
+            offset = epoch - (t0+t1)/2
+            uncertainty = (t1-t0)/2
+            h.samples.append(Sample(t0, t1, epoch, offset, uncertainty, t1-t0))
+        except ValueError:
+            h.samples.append(Sample(t0, t1, None, None, None, t1-t0, c.stderr.strip()[:150] or 'invalid remote clock response'))
+        if args.sample_interval and _ < args.samples-1:
+            time.sleep(args.sample_interval)
+    valid = [s for s in h.samples if s.offset is not None]
+    if valid:
+        best = min(valid, key=lambda s: s.duration)
+        h.offset_seconds = best.offset
+        h.uncertainty_seconds = best.uncertainty
+        h.rtt_seconds = best.duration
+    else:
+        h.warnings.append('no valid clock samples')
+    h.elapsed_seconds = time.monotonic()-start
+    return h
+
+def assess(hosts: list[Host], args: argparse.Namespace) -> list[Finding]:
+    findings = []
+    def add(severity: str, code: str, host: str, detail: str):
+        findings.append(Finding(severity, code, host, detail))
+    for h in hosts:
+        if not h.reachable:
+            add('critical', 'UNREACHABLE', h.target, '; '.join(h.errors))
+            continue
+        name = h.hostname or h.target
+        if h.ntp_synchronized is False:
+            add('critical', 'UNSYNCHRONIZED', name, 'timedatectl reports clock not synchronized')
+        elif h.ntp_synchronized is None:
+            add('info', 'SYNC_UNKNOWN', name, 'synchronization state unavailable')
+        if h.ntp_enabled is False:
+            add('warning', 'NTP_DISABLED', name, 'NTP management is disabled')
+        if h.rtc_local is True:
+            add('warning', 'LOCAL_RTC', name, 'RTC configured in local time')
+        if h.offset_seconds is not None and h.uncertainty_seconds is not None:
+            lower = max(0.0, abs(h.offset_seconds)-h.uncertainty_seconds)
+            upper = abs(h.offset_seconds)+h.uncertainty_seconds
+            if lower > args.skew_threshold:
+                add('critical', 'CLOCK_OFFSET', name, f'estimated offset {h.offset_seconds:+.6f}s ±{h.uncertainty_seconds:.6f}s; exceeds {args.skew_threshold:.3f}s')
+            elif upper > args.skew_threshold:
+                add('warning', 'CLOCK_UNCERTAIN', name, f'offset {h.offset_seconds:+.6f}s ±{h.uncertainty_seconds:.6f}s overlaps threshold')
+        if h.rtt_seconds is not None and h.rtt_seconds > args.rtt_warning:
+            add('warning', 'HIGH_RTT', name, f'probe round trip {h.rtt_seconds:.3f}s; offset estimate is less precise')
+        if h.chrony_active and not h.chrony_tracking:
+            add('warning', 'CHRONY_UNAVAILABLE', name, 'chronyd active but tracking data unavailable')
+        for w in h.warnings:
+            add('info', 'PARTIAL_DATA', name, w)
+    reachable = [h for h in hosts if h.reachable]
+    if len(reachable) > 1:
+        zones = {h.timezone for h in reachable if h.timezone}
+        if len(zones) > 1:
+            add('info', 'ZONE_VARIATION', '*', 'hosts use different timezone identifiers; this is not inherently an error')
+        versions = {h.tzdata_version for h in reachable if h.tzdata_version}
+        if len(versions) > 1:
+            add('info', 'TZDATA_VARIATION', '*', 'tzdata package versions differ across hosts; cross-distribution release strings are not directly comparable')
+        hashes = {}
+        for h in reachable:
+            if h.timezone and h.localtime_sha256:
+                hashes.setdefault(h.timezone, set()).add(h.localtime_sha256)
+        for zone, values in hashes.items():
+            if len(values) > 1:
+                add('warning', 'ZONE_RULE_VARIATION', '*', f'{zone} has different /etc/localtime content hashes')
+        known = [(h, h.offset_seconds, h.uncertainty_seconds) for h in reachable if h.offset_seconds is not None and h.uncertainty_seconds is not None]
+        for i, (a, ao, au) in enumerate(known):
+            for b, bo, bu in known[i+1:]:
+                delta = abs(ao-bo)
+                if delta-au-bu > args.skew_threshold:
+                    add('critical', 'INTERHOST_SKEW', '*', f'{a.target} vs {b.target}: estimated difference {delta:.6f}s, combined uncertainty {au+bu:.6f}s')
+    order = {'critical': 0, 'warning': 1, 'info': 2}
+    return sorted(findings, key=lambda f: (order[f.severity], f.host, f.code))
+
+class Palette:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+    def color(self, s: str, code: str) -> str:
+        return '\033['+code+'m'+s+'\033[0m' if self.enabled else s
+    def title(self, s: str) -> str:
+        return self.color(s, '1;36')
+    def ok(self, s: str) -> str:
+        return self.color(s, '32')
+    def warn(self, s: str) -> str:
+        return self.color(s, '33')
+    def bad(self, s: str) -> str:
+        return self.color(s, '31')
+    def dim(self, s: str) -> str:
+        return self.color(s, '2')
+
+def pretty_bool(value: bool | None) -> str:
+    return 'yes' if value is True else 'no' if value is False else '?'
+
+def table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [min(36, max(len(str(row[i])) for row in [headers]+rows)) for i in range(len(headers))]
+    def line(row):
+        return '  '.join(str(value)[:widths[i]].ljust(widths[i]) for i, value in enumerate(row))
+    return '\n'.join([line(headers), line(['-'*w for w in widths])]+[line(r) for r in rows])
+
+def render(hosts: list[Host], findings: list[Finding], args: argparse.Namespace, started: float) -> str:
+    p = Palette(args.color == 'always' or (args.color == 'auto' and sys.stdout.isatty()))
+    lines = [p.title('ZONEINFO / DISTRIBUTED TIME FORENSICS'), p.dim(f'version {VERSION}  |  hosts {len(hosts)}  |  elapsed {time.monotonic()-started:.2f}s'), '']
+    rows = []
+    for h in hosts:
+        offset = f'{h.offset_seconds:+.5f}' if h.offset_seconds is not None else '-'
+        uncertainty = f'{h.uncertainty_seconds:.5f}' if h.uncertainty_seconds is not None else '-'
+        rows.append([h.hostname or h.target, 'UP' if h.reachable else 'DOWN', h.timezone or '-', h.utc_offset or '-', pretty_bool(h.ntp_synchronized), pretty_bool(h.chrony_active), offset, uncertainty])
+    lines.extend([p.title('FLEET OVERVIEW'), table(['HOST','STATE','TIMEZONE','UTC','SYNC','CHRONY','OFFSET(s)','ERROR(±s)'], rows), ''])
+    lines.append(p.title('FINDINGS'))
+    if not findings:
+        lines.append(p.ok('No findings'))
+    for f in findings:
+        severity = p.bad(f.severity.upper()) if f.severity == 'critical' else p.warn(f.severity.upper()) if f.severity == 'warning' else p.dim(f.severity.upper())
+        lines.append(f'{severity:>8}  {f.code:<22} {f.host}: {f.detail}')
+    lines.append('')
+    for h in hosts:
+        lines.append(p.title('HOST / '+(h.hostname or h.target)))
+        lines.append(f'  target={h.target} transport={"local" if h.local else "ssh"} reachable={h.reachable} elapsed={h.elapsed_seconds:.3f}s')
+        if not h.reachable:
+            lines.extend('  error='+e for e in h.errors)
+            lines.append('')
+            continue
+        for label, value in [('operating system', h.os_name), ('kernel', h.kernel), ('timezone', h.timezone), ('timezone source', h.timezone_source), ('UTC offset', h.utc_offset), ('abbreviation', h.abbreviation), ('localtime target', h.localtime_target), ('localtime sha256', h.localtime_sha256), ('tzdata package', h.tzdata_version), ('NTP enabled', pretty_bool(h.ntp_enabled)), ('synchronized', pretty_bool(h.ntp_synchronized)), ('RTC local', pretty_bool(h.rtc_local)), ('chronyd active', pretty_bool(h.chrony_active))]:
+            lines.append(f'  {label:<20} {value or "-"}')
+        if h.offset_seconds is not None:
+            lines.append(f'  estimated offset     {h.offset_seconds:+.9f}s ±{h.uncertainty_seconds:.9f}s (minimum RTT sample)')
+        if h.chrony_tracking:
+            lines.append('  CHRONY TRACKING')
+            for key, value in h.chrony_tracking.items():
+                lines.append(f'    {key:<24} {value}')
+        if h.chrony_sources and args.show_sources:
+            lines.append('  CHRONY SOURCES')
+            lines.extend('    '+line for line in h.chrony_sources)
+        if h.timesyncd_status and args.show_timesyncd:
+            lines.append('  TIMESYNCD')
+            for key, value in h.timesyncd_status.items():
+                lines.append(f'    {key:<24} {value}')
+        if args.show_samples:
+            lines.append('  CLOCK SAMPLES')
+            for i, sample in enumerate(h.samples, 1):
+                lines.append(f'    {i:02d}  RTT={sample.duration:.6f}s offset={sample.offset if sample.offset is not None else "?"} uncertainty={sample.uncertainty if sample.uncertainty is not None else "?"} {sample.error}')
+        lines.append('')
+    lines.extend([p.dim('Clock estimates use midpoint timing and an RTT/2 uncertainty bound.'), p.dim('This is not a replacement for chrony measurements or an NTP protocol implementation.')])
+    return '\n'.join(lines)
+
+def targets_from_args(args: argparse.Namespace) -> list[str]:
     targets = list(args.hosts)
     if args.hosts_file:
-        targets.extend(read_hosts_from_file(args.hosts_file))
-    targets = unique_preserve_order(targets)
-    if not targets:
-        targets = ["localhost"]
-    return targets
+        for line in pathlib.Path(args.hosts_file).read_text(encoding='utf-8').splitlines():
+            item = line.strip()
+            if item and not item.startswith('#'):
+                targets.append(item)
+    return list(dict.fromkeys(targets or ['localhost']))
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Zoneinfo v2: distributed Linux timezone, chrony and clock forensics')
+    parser.add_argument('hosts', nargs='*')
+    parser.add_argument('--hosts-file')
+    parser.add_argument('--ssh-user')
+    parser.add_argument('--ssh-port', type=int, default=22)
+    parser.add_argument('--ssh-option', action='append', default=[])
+    parser.add_argument('--host-key-policy', choices=['yes','accept-new'], default='yes')
+    parser.add_argument('--connect-timeout', type=int, default=5)
+    parser.add_argument('--timeout', type=float, default=15)
+    parser.add_argument('--sample-timeout', type=float, default=8)
+    parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--samples', type=int, default=5)
+    parser.add_argument('--sample-interval', type=float, default=0.05)
+    parser.add_argument('--skew-threshold', type=float, default=3.0)
+    parser.add_argument('--rtt-warning', type=float, default=1.0)
+    parser.add_argument('--local-alias', action='append', default=[])
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--json-file')
+    parser.add_argument('--include-raw', action='store_true')
+    parser.add_argument('--show-samples', action='store_true')
+    parser.add_argument('--show-sources', action='store_true')
+    parser.add_argument('--show-timesyncd', action='store_true')
+    parser.add_argument('--color', choices=['auto','always','never'], default='auto')
+    parser.add_argument('--strict', action='store_true')
+    parser.add_argument('--fail-on-warning', action='store_true')
+    parser.add_argument('--version', action='version', version=VERSION)
+    args = parser.parse_args()
+    if args.workers < 1 or not 1 <= args.samples <= 100 or args.sample_interval < 0 or args.timeout <= 0 or args.sample_timeout <= 0 or args.skew_threshold < 0 or args.rtt_warning <= 0 or not 1 <= args.ssh_port <= 65535 or args.connect_timeout < 1:
+        parser.error('invalid worker, sample, timeout, threshold or SSH settings')
+    return args
 
-def print_command_logs(probes: List[HostProbe]) -> None:
-    print("Command Execution")
-    print("-" * 120)
-    for probe in probes:
-        name = probe.hostname or probe.host
-        for entry in probe.command_log:
-            print(f"host={name} rc={entry.returncode} duration={entry.duration_s:.3f}s command={shlex.quote(entry.command[:200])}")
-            if entry.stderr.strip():
-                print(f"stderr={entry.stderr.strip()}")
-    print("")
-
-
-def compute_exit_code(summary: ComparisonSummary, probes: List[HostProbe], strict: bool) -> int:
-    if any(not p.reachable for p in probes):
-        return 2 if strict else 0
-    mismatch = any(
-        not state
-        for state in [
-            summary.timezone_consistent,
-            summary.localtime_target_consistent,
-            summary.localtime_hash_consistent,
-            summary.zoneinfo_hash_consistent,
-            summary.ntp_consistent,
-            summary.synchronized_consistent,
-            summary.utc_offset_consistent,
-            summary.clock_skew_within_threshold,
-        ]
-    )
-    if mismatch and strict:
-        return 3
+def main() -> int:
+    args = parse_args()
+    started = time.monotonic()
+    try:
+        targets = targets_from_args(args)
+    except OSError as exc:
+        print(f'zoneinfo: cannot read host list: {exc}', file=sys.stderr)
+        return 1
+    runner = Runner(args)
+    aliases = local_names(args)
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(inspect, target, args, runner, aliases): target for target in targets}
+        for future in concurrent.futures.as_completed(futures):
+            target = futures[future]
+            try:
+                result[target] = future.result()
+            except Exception as exc:
+                result[target] = Host(target=target, errors=[f'internal probe error: {exc}'])
+    hosts = [result[target] for target in targets]
+    findings = assess(hosts, args)
+    generated = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    payload = {'tool':'zoneinfo', 'version':VERSION, 'generated_at':generated, 'duration_seconds':time.monotonic()-started, 'hosts':[dataclasses.asdict(h) for h in hosts], 'findings':[dataclasses.asdict(f) for f in findings], 'summary':{'total':len(hosts), 'reachable':sum(h.reachable for h in hosts), 'critical':sum(f.severity=='critical' for f in findings), 'warning':sum(f.severity=='warning' for f in findings), 'info':sum(f.severity=='info' for f in findings)}}
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    if args.json_file:
+        try:
+            pathlib.Path(args.json_file).write_text(serialized+'\n', encoding='utf-8')
+        except OSError as exc:
+            print(f'zoneinfo: cannot write JSON: {exc}', file=sys.stderr)
+            return 1
+    print(serialized if args.json else render(hosts, findings, args, started))
+    if args.strict:
+        if any(not h.reachable for h in hosts):
+            return 2
+        if any(f.severity=='critical' or (args.fail_on_warning and f.severity=='warning') for f in findings):
+            return 3
     return 0
 
-
-def main() -> None:
-    args = parse_args()
-    targets = collect_targets(args)
-
-    if args.workers <= 0:
-        print("workers must be positive", file=sys.stderr)
-        sys.exit(1)
-
-    executor = RemoteExecutor(
-        ssh_user=args.ssh_user,
-        ssh_port=args.ssh_port,
-        ssh_options=args.ssh_option,
-        connect_timeout=args.timeout,
-    )
-    inspector = HostInspector(executor=executor)
-    comparator = Comparator(skew_threshold_seconds=args.skew_threshold)
-    formatter = Formatter(use_color=not args.no_color and not args.json)
-
-    probes: List[HostProbe] = []
-
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        future_map = {
-            pool.submit(inspector.inspect, target, args.local_alias): target
-            for target in targets
-        }
-        for future in as_completed(future_map):
-            target = future_map[future]
-            try:
-                probe = future.result()
-            except Exception as exc:
-                probe = HostProbe(
-                    host=target,
-                    target=target,
-                    is_local=False,
-                    reachable=False,
-                    error=f"internal_error: {exc}",
-                )
-            probes.append(probe)
-
-    probes.sort(key=lambda p: targets.index(p.target))
-    summary = comparator.compare(probes)
-
-    if args.show_commands and not args.json:
-        print_command_logs(probes)
-
-    if args.json:
-        print(formatter.render_json(probes, summary))
-    else:
-        print(formatter.render_table(probes, summary))
-
-    sys.exit(compute_exit_code(summary, probes, args.strict))
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
